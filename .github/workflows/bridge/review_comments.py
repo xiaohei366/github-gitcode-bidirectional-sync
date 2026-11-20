@@ -14,10 +14,6 @@ HUNK = re.compile(r'^@@ -[0-9]+(?:,[0-9]+)? \+([0-9]+)(?:,([0-9]+))? @@')
 COMMENT_LABEL = {'diff': 'inline comment', 'pr': 'PR comment', 'reply': 'discussion reply'}
 
 
-class ReplyMethodUnavailable(BridgeError):
-    """The destination explicitly rejected the nested POST method."""
-
-
 def right_lines(patch):
     """Only count right-side lines actually present in a published diff hunk."""
     lines = {}
@@ -78,8 +74,8 @@ def quoted_reply_body(item, root_note_id=None):
     header = '> 回复'
     if item.reply_path:
         header += ' ' + markdown_path(item.reply_path)
-    elif root_note_id is not None:
-        header += ' #' + root_note_id
+    if root_note_id is not None:
+        header += f' [原评论](#tid-{root_note_id})'
     return f'{header}\n\n{item.body}'
 
 
@@ -225,7 +221,8 @@ def preview_comments(bridge, number, target_path=None, records=None):
         counts[kind] += 1
     print(f'REVIEW preview GitHub PR #{number} | pr_comment={counts["pr"]}, diff_comment={counts["diff"]}, '
           f'single-line candidates={counts["candidate"]} (pr_comment if unverified), '
-          f'thread replies={counts["reply"]}, unconfirmed writes={unconfirmed}')
+          f'thread replies={counts["reply"]} (nested on code reviews, quoted on ordinary comments), '
+          f'unconfirmed writes={unconfirmed}')
 
 
 class CommentDelivery:
@@ -256,8 +253,9 @@ class CommentDelivery:
             if (str(detail.get('id')) != note_id or not isinstance(discussion, str)
                     or not discussion or discussion in ('.', '..')):
                 raise BridgeError(f'Could not verify the discussion of destination root {note_id}')
-            self.discussions[note_id] = discussion
-        return {'root_note_id': note_id, 'discussion_id': self.discussions[note_id]}
+            thread = {'root_note_id': note_id, 'discussion_id': discussion}
+            self.discussions[note_id] = (thread, self.thread_root(thread)['comment_type'])
+        return self.discussions[note_id]
 
     def thread_root(self, intent):
         # An unfiltered PR list includes both kinds of roots, including those saved by older controllers.
@@ -355,10 +353,7 @@ class CommentDelivery:
             except ApiError as error:
                 # Clear only a definite rejection. Unknown outcomes keep the
                 # actual account and original note list for reconciliation.
-                if kind == 'reply' and error.code in (405, 501):
-                    self.save(source_id, None)
-                    raise ReplyMethodUnavailable(str(error)) from error
-                if error.code in (400, 401, 403, 404, 405, 422):
+                if error.code in (400, 401, 403, 404, 405, 422, 501):
                     self.save(source_id, None)
                 raise
             return attempt, response
@@ -377,19 +372,13 @@ class CommentDelivery:
         self.save(source_id, found)
 
     def post_reply(self, item, intent):
-        intent = {**intent, **self.discussion_for(item.reply_to)}
-        try:
-            self.post(item.key, intent)
-        except ReplyMethodUnavailable:
-            # A closed or already merged PR also returns 405. Only flatten an explicitly unsupported ordinary thread.
-            if self.thread_root(intent)['comment_type'] != 'pr_comment':
-                raise
-            pull = self.bridge.target_api.call('GET', self.path)
-            if (pull.get('state') not in ('open', 'opened', 'reopen', 'reopened')
-                    or pull.get('merged_at') or pull.get('merged')):
-                raise
-            self.post(item.key, {'kind': 'pr', 'account': intent['account'],
-                                 'payload': {'body': quoted_reply_body(item, intent['root_note_id'])}})
+        thread, root_type = self.discussion_for(item.reply_to)
+        if root_type == 'pr_comment':
+            # GitCode stores nested replies to ordinary notes but omits them from the web discussion.
+            intent = {**intent, 'kind': 'pr', 'payload': {'body': quoted_reply_body(item, thread['root_note_id'])}}
+        else:
+            intent = {**intent, **thread}
+        self.post(item.key, intent)
 
     def recover(self):
         # Recover an interrupted write even if GitHub has since edited or removed the source comment.

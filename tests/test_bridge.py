@@ -1571,7 +1571,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(self.review_writes), 5)
 
     def test_rejected_reply_recovers_as_robot_then_the_next_member_replies_to_the_same_root(self):
-        root = dict(self.review_pr(), subject_type='file', user={'id': 77})
+        root = dict(self.review_pr(), user={'id': 77})
         first = dict(root, id=12, in_reply_to_id=11, user={'id': 10}, body='First **reply**.\r\n  \n')
         second = dict(first, id=13, user={'id': 20}, body='Follow-up with markup and spacing.  \n',
                       created_at='2026-11-01T12:01:00Z')
@@ -1593,7 +1593,8 @@ class BridgeTests(unittest.TestCase):
         self.assertIn('unconfirmed writes=1', self.run_bridge(check=True))
         self.run_bridge()
         self.run_bridge()
-        self.assertEqual(self.review_writes, [('bot-token', {'body': '> `common.txt`\n\n' + root['body']}),
+        self.assertEqual(self.review_writes, [('bot-token', {'body': root['body'], 'path': 'common.txt',
+                                                             'position': 2, 'position_type': 'text'}),
                                               ('bot-token', {'body': first['body']}),
                                               ('bob-token', {'body': second['body']})])
         self.assertEqual([c['id'] for c in self.review_notes['1'][0]['reply']], [101, 102])
@@ -1601,6 +1602,30 @@ class BridgeTests(unittest.TestCase):
             self.assertIsNone(store.progress['pending'])
             self.assertEqual(store.review_comments['1'], {'11': '100', '12': '101', '13': '102'})
         self.assertEqual(self.target_pulls['1']['state'], 'merged')
+
+    def test_replies_to_ordinary_reviews_are_visible_once_and_identify_their_own_roots(self):
+        root = dict(self.review_pr(), subject_type='file', user={'id': 77})
+        older = dict(root, id=12, subject_type='line', line=None, original_line=81)
+        text = '已修复。\r\n\r\n- **Done**  \n'
+        first = dict(root, id=13, in_reply_to_id=11, body=text, user={'id': 10},
+                     created_at='2026-11-01T12:01:00Z')
+        second = dict(first, id=14, in_reply_to_id=12, user={'id': 77}, created_at='2026-11-01T12:02:00Z')
+        third = dict(first, id=15, in_reply_to_id=13, created_at='2026-11-01T12:03:00Z')
+        self.source_comments['5'] = [third, second, first, older, root]
+        self.deny_once[('alice-token', 'POST', '/pulls/1/comments')] = 403
+        self.run_bridge()
+        self.run_bridge()
+        notes = self.review_notes['1']
+        self.assertEqual(len(notes), 5)
+        self.assertTrue(all(n['comment_type'] == 'pr_comment' and not n['reply'] for n in notes))
+        self.assertEqual([n['body'] for n in notes[2:]],
+                         [f'> 回复 `common.txt` [原评论](#tid-{oid})\n\n{text}' for oid in (100, 101, 100)])
+        self.assertEqual([n['user']['login'] for n in notes[2:]], [BOT['username']] * 3)
+        self.assertEqual(self.target_pulls['1']['state'], 'merged')
+        with self.session() as (_, store):
+            self.assertIsNone(store.progress['pending'])
+            self.assertEqual(store.review_comments['1'], {'11': '100', '12': '101', '13': '102',
+                                                         '14': '103', '15': '104'})
 
     def test_orphan_replies_recover_as_pr_comments_and_allow_the_other_reviews_and_merge(self):
         base = self.review_pr()

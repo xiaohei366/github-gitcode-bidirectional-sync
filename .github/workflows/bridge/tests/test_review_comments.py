@@ -108,7 +108,7 @@ class SourceTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as output:
             preview_comments(self.bridge, 5, '/pulls/24', {'issue:7': {'kind': 'pr'}})
         self.assertIn('pr_comment=1, diff_comment=1, single-line candidates=0', output.getvalue())
-        self.assertIn('thread replies=1', output.getvalue())
+        self.assertIn('thread replies=1 (nested on code reviews, quoted on ordinary comments)', output.getvalue())
         self.assertIn('unconfirmed writes=1', output.getvalue())
         with redirect_stdout(io.StringIO()) as output:
             preview_comments(self.bridge, 5, records={'9': '120'})
@@ -290,10 +290,9 @@ class ThreadReceiptTests(unittest.TestCase):
         self.bridge.mapping, self.bridge.verified_members = {'7': MEMBER}, {MEMBER['id']: (MEMBER, self.member)}
         self.bridge.unavailable_members, self.bridge.member_secrets = set(), {}
         self.bridge.verify_pending_refs = Mock()
-        self.root = {'id': 120, 'discussion_id': 'thread', 'comment_type': 'pr_comment', 'reply': []}
+        self.root = {'id': 120, 'discussion_id': 'thread', 'comment_type': 'diff_comment', 'reply': []}
         self.roots = [self.root]
         self.details = {'120': {'id': 120, 'discussion_id': 'thread'}}
-        self.pull = {'state': 'open'}
         self.api.pages.side_effect = self.pages
         self.api.call.side_effect = self.read
 
@@ -303,7 +302,7 @@ class ThreadReceiptTests(unittest.TestCase):
 
     def read(self, method, path):
         self.assertEqual(method, 'GET')
-        return self.pull if path == '/pulls/24' else self.details[path.rsplit('/', 1)[1]]
+        return self.details[path.rsplit('/', 1)[1]]
 
     def add_child(self, oid, account=MEMBER, body=RAW):
         user = {'id': account['id'], 'login': account['username']}
@@ -350,7 +349,6 @@ class ThreadReceiptTests(unittest.TestCase):
                 self.assertNotIn('8', self.store.review_comments['24'])
 
     def test_exact_note_id_selects_the_posted_child_among_identical_replies_on_a_line(self):
-        self.root['comment_type'] = 'diff_comment'
         self.add_child(121)
 
         def publish(method, path, payload):
@@ -417,33 +415,42 @@ class ThreadReceiptTests(unittest.TestCase):
 
     def test_list_permission_error_before_writing_keeps_the_member_and_its_receipt_untouched(self):
         self.api.pages.side_effect = ApiError('gitcode', 403)
-        with self.assertRaisesRegex(BridgeError, 'before publishing'):
+        with self.assertRaisesRegex(BridgeError, 'HTTP 403'):
             self.deliver()
         self.member.call.assert_not_called()
         self.assertFalse(self.bridge.unavailable_members)
         self.assertNotIn('8', self.store.review_comments['24'])
 
-    def test_unsupported_ordinary_thread_recovers_the_located_fallback_only_once(self):
-        fallback = '> 回复 `file.py`\n\n' + RAW
+    def test_ordinary_root_reply_is_visible_and_recovers_as_one_top_level_comment(self):
+        self.root['comment_type'] = 'pr_comment'
+        expected = '> 回复 `file.py` [原评论](#tid-120)\n\n' + RAW
 
         def publish(method, path, payload):
-            if path == self.path:
-                self.assertEqual(payload, {'body': RAW})
-                raise ApiError('gitcode', 405)
-            self.assertEqual((method, path, payload), ('POST', '/pulls/24/comments', {'body': fallback}))
-            self.add_member_pr_comment(124, fallback)
+            self.assertEqual((method, path, payload), ('POST', '/pulls/24/comments', {'body': expected}))
+            self.add_member_pr_comment(124, expected)
             raise BridgeError('lost response')
 
         self.member.call.side_effect = publish
         with self.assertRaisesRegex(BridgeError, 'lost response'):
             self.deliver()
         record = self.store.review_comments['24']['8']
-        self.assertEqual((record['kind'], record['account'], record['payload']), ('pr', MEMBER, {'body': fallback}))
+        self.assertEqual((record['kind'], record['account'], record['payload']), ('pr', MEMBER, {'body': expected}))
         self.source.clear()
         self.deliver()
         self.deliver()
         self.assertEqual(self.store.review_comments['24']['8'], '124')
-        self.assertEqual(self.member.call.call_count, 2)
+        self.member.call.assert_called_once()
+        self.assertFalse(self.root['reply'])
+
+    def test_recovers_a_legacy_nested_write_on_an_ordinary_root_without_reposting(self):
+        self.root['comment_type'] = 'pr_comment'
+        self.store.review_comments['24']['8'] = {'kind': 'reply', 'root_note_id': '120', 'discussion_id': 'thread',
+                                                 'before': [], 'payload': {'body': RAW}, 'account': MEMBER}
+        self.add_child(124)
+        self.deliver()
+        self.deliver()
+        self.assertEqual(self.store.review_comments['24']['8'], '124')
+        self.member.call.assert_not_called()
 
     def test_orphan_recovers_a_single_top_level_comment_under_its_bare_id(self):
         del self.store.review_comments['24']['7']
@@ -473,20 +480,25 @@ class ThreadReceiptTests(unittest.TestCase):
         self.member.call.assert_not_called()
         self.assertNotIn('8', self.store.review_comments['24'])
 
-    def test_ineligible_thread_or_uncertain_failure_does_not_create_a_top_level_comment(self):
-        for kind, pull, status in [('diff_comment', {'state': 'open'}, 501),
-                                   ('pr_comment', {'state': 'closed'}, 405),
-                                   ('pr_comment', {'state': 'open', 'merged_at': 'yesterday'}, 405),
-                                   ('pr_comment', {'state': 'open'}, 502)]:
-            with self.subTest(kind=kind, pull=pull, status=status):
-                self.root['comment_type'], self.pull = kind, pull
-                self.member.call.reset_mock()
-                self.member.call.side_effect = ApiError('gitcode', status)
-                with self.assertRaisesRegex(BridgeError, str(status)):
-                    self.deliver()
-                self.member.call.assert_called_once_with('POST', self.path, {'body': RAW})
-                record = self.store.review_comments['24'].get('8')
-                self.assertEqual(record['kind'] if record else None, 'reply' if status == 502 else None)
+    def test_delivery_errors_never_switch_to_the_other_reply_endpoint(self):
+        for kind in ('diff_comment', 'pr_comment'):
+            for status in (405, 501, 502):
+                with self.subTest(kind=kind, status=status):
+                    self.store.review_comments['24'].pop('8', None)
+                    self.root['comment_type'] = kind
+                    self.member.call.reset_mock()
+                    self.member.call.side_effect = ApiError('gitcode', status)
+                    with self.assertRaisesRegex(BridgeError, str(status)):
+                        self.deliver()
+                    nested = kind == 'diff_comment'
+                    path = self.path if nested else '/pulls/24/comments'
+                    body = RAW if nested else '> 回复 `file.py` [原评论](#tid-120)\n\n' + RAW
+                    self.member.call.assert_called_once_with('POST', path, {'body': body})
+                    record = self.store.review_comments['24'].get('8')
+                    if status == 502:
+                        self.assertEqual(record['kind'], 'reply' if nested else 'pr')
+                    else:
+                        self.assertIsNone(record)
 
     def test_readback_failure_after_a_successful_nested_post_keeps_the_nested_intent(self):
         def publish(*args):
