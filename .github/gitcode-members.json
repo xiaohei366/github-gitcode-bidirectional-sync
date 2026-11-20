@@ -1,0 +1,13 @@
+[
+  {
+    "github": {
+      "id": "00000000",
+      "username": "example-github-user"
+    },
+    "gitcode": {
+      "id": "example-gitcode-id",
+      "username": "example-gitcode-user"
+    },
+    "gitcode_pr_token_secret": "GITCODE_MEMBER_EXAMPLE_TOKEN"
+  }
+]

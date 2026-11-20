@@ -1,0 +1,10 @@
+{
+  "gitcode": {
+    "repo": "YOUR_GITCODE_ORG/your-project",
+    "bot": {
+      "id": "replace-with-gitcode-bot-id",
+      "username": "sync-bot",
+      "email": "REPLACE_WITH_BOT_COMMIT_EMAIL"
+    }
+  }
+}
