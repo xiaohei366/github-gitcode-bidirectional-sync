@@ -9,8 +9,9 @@ from pathlib import Path
 import re
 import sys
 from tempfile import TemporaryDirectory
+from time import sleep
 
-from api import Api, ApiError, BridgeError, same_account
+from api import Api, ApiError, ApiTransportError, BridgeError, same_account
 from git_ops import CommitIdentityMismatch, Git, MASTER_BRANCH, MASTER_REF, Remote, repository, sha
 from import_plan import plan_import
 from review_comments import CommentDelivery, preview_comments
@@ -21,6 +22,8 @@ MEMBER_SECRET_NAME = re.compile(r'GITCODE_MEMBER_[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_T
 DEFAULT_MEMBERS_FILE = Path(__file__).resolve().parents[2] / 'gitcode-members.json'
 EMAIL = re.compile(r'[^@<>\x00-\x20\x7f]+@[^@<>\x00-\x20\x7f]+')
 ZERO_SHA = '0' * 40
+PR_READBACK_DELAYS = (0, 2, 5, 10)
+PR_PUBLICATION_ATTEMPTS = 2
 
 
 def validate_account(account, *, github=False, bot=False):
@@ -135,6 +138,28 @@ def pull_number(pull):
 
 def pull_is_merged(pull):
     return pull.get('state') == 'merged' or bool(pull.get('merged_at'))
+
+
+def pull_body(pull):
+    return pull.get('body') or pull.get('description') or ''
+
+
+def link_direct_push(body, draft_body, links):
+    missing = [f'- {link}' for link, url in links if f']({url})' not in body]
+    if not missing:
+        return body
+    separator = '\n' if body == draft_body else '\n\n'
+    return (body + separator if body else '') + '\n'.join(missing)
+
+
+def publication_changes(pull, fields):
+    desired = dict(fields)
+    if not pull_is_merged(pull):
+        if pull.get('state') not in ('open', 'opened', 'reopen', 'reopened'):
+            raise BridgeError('The destination PR is closed. Reopen it before rerunning the workflow.')
+        desired['draft'] = False
+    actual = {'title': pull.get('title'), 'body': pull_body(pull), 'draft': pull.get('draft')}
+    return {name: value for name, value in desired.items() if actual[name] != value}
 
 
 class Bridge:
@@ -296,6 +321,36 @@ class Bridge:
                 number = pull_number(row)
         return number
 
+    def publication_request(self, method, path, fields=None):
+        try:
+            return self.target_api.call(method, path, fields)
+        except (ApiError, ApiTransportError) as error:
+            if isinstance(error, ApiError) and error.code not in (408, 429, 500, 502, 503, 504):
+                raise
+            print(f'WARNING {method} {path}: {error}. Reading the destination PR again.')
+            return None
+
+    def publication_reads(self, path, pending):
+        """Read the same prepared PR. A failed last read cannot authorize another PATCH."""
+        creator = pending.get('creator', self.bot)
+        for delay in PR_READBACK_DELAYS:
+            if delay:
+                sleep(delay)
+            pull = self.publication_request('GET', path)
+            if pull is None:
+                continue
+            if not isinstance(pull, dict):
+                raise BridgeError('Destination API returned an invalid PR')
+            head = pull.get('head') or {}
+            if (path != f'/pulls/{pull_number(pull)}' or not same_account(pull.get('user') or {}, creator)
+                    or (pull.get('base') or {}).get('ref') != MASTER_BRANCH
+                    or (not pull_is_merged(pull)
+                        and (head.get('ref') != pending['branch'] or head.get('sha') != pending['head']))):
+                raise BridgeError('The destination PR does not match the prepared import')
+            yield pull
+        if pull is None:
+            raise BridgeError(f'Could not read {path} to confirm its publication. The import is still pending.')
+
     def prepare_pull(self, store, progress, number, original):
         pending = progress['pending']
         creator = pending.get('creator', self.bot)
@@ -322,47 +377,36 @@ class Bridge:
                 return intent, pull_number(api.call('POST', '/pulls', fields))
 
             pending, number = self.post_as(creator, create)
-            creator = pending['creator']
         number = pull_number({'number': number})
         path = f'/pulls/{number}'
-        pull = self.target_api.call('GET', path)
-        head = pull.get('head') or {}
-        merged = pull_is_merged(pull)
-        if (not same_account(pull.get('user') or {}, creator)
-                or (pull.get('base') or {}).get('ref') != MASTER_BRANCH
-                or (not merged and (head.get('ref') != branch or head.get('sha') != pending['head']))):
-            raise BridgeError('The destination PR does not match the prepared import')
         store.save({**progress, 'pending': {**pending, 'number': number}})
-        if not merged and pull.get('state') not in ('open', 'opened', 'reopen', 'reopened'):
-            raise BridgeError('The destination PR is closed. Reopen it before rerunning the workflow.')
+        pull = next(self.publication_reads(path, pending))
 
         target_url = f'https://gitcode.com/{self.target.repo}/pull/{number}'
         target_link = f'[GitCode PR #{number}]({target_url})'
-        stored = pull.get('body') or pull.get('description') or ''
-        if original is not None:
-            body = f'{source_link} <-> {target_link}{suffix}'
-        else:
-            # Direct pushes and baseline alignment have no source PR text to copy.
-            body = stored
-            missing = [f'- {link}' for link, url in ((source_link, source_url), (target_link, target_url))
-                       if f']({url})' not in stored]
-            if missing:
-                separator = '\n' if body == draft_body else '\n\n'
-                body = (body + separator if body else '') + '\n'.join(missing)
-
-        if body != stored or (original is not None and pull.get('title') != title) or (not merged and pull.get('draft')):
-            fields = {'body': body}
+        links = ((source_link, source_url), (target_link, target_url))
+        initial_body = pull_body(pull)
+        for attempt in range(PR_PUBLICATION_ATTEMPTS):
             if original is not None:
-                fields['title'] = title
-            if not merged:
-                fields['draft'] = False
-            self.target_api.call('PATCH', path, fields)
-            published = self.target_api.call('GET', path)
-            if ((published.get('body') or published.get('description')) != body
-                    or (original is not None and published.get('title') != title)
-                    or (not merged and published.get('draft'))):
-                raise BridgeError('Could not confirm the published destination PR title and Markdown description')
-        return path, merged
+                fields = {'title': title, 'body': f'{source_link} <-> {target_link}{suffix}'}
+            else:
+                # Keep maintainer additions on direct pushes; a conflicting edit needs a fresh import read.
+                latest_body = pull_body(pull)
+                if initial_body not in latest_body:
+                    raise BridgeError('Destination PR notes changed during publication. The import is still pending.')
+                fields = {'body': link_direct_push(latest_body, draft_body, links)}
+            changes = publication_changes(pull, fields)
+            if not changes:
+                return path, pull_is_merged(pull)
+            if attempt:
+                print(f'Retrying publication of GitCode PR #{number}. Unconfirmed fields: {", ".join(changes)}')
+            self.publication_request('PATCH', path, changes)
+            for pull in self.publication_reads(path, pending):
+                changes = publication_changes(pull, fields)
+                if not changes:
+                    return path, pull_is_merged(pull)
+        raise BridgeError(f'Could not confirm the published fields for GitCode PR #{number}: {", ".join(changes)}. '
+                          'The import is still pending.')
 
     def verify_pending_refs(self, pending):
         if self.git.tip(self.target, self.git.branch_ref(pending['branch'])) != pending['head']:

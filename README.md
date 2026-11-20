@@ -56,6 +56,8 @@ sequenceDiagram
   C->>GC: 核验本批次提交和根 tree，推进全局游标
 ```
 
+发布草稿后，机器人立即读回 GitCode PR，核对标题、配对链接、原始 Markdown 和草稿状态。若仍看到旧值，会依次等待 2、5、10 秒再读。若最后一次读回仍有差异，机器人在同一笔 PR 上只补写缺失字段一次，并再次核对。核对通过后才发评论和合入。若权限被拒、一直读不到结果，或第二次写入后内容仍有差异，工作流会保留 `pending` 和已有 PR，供后续运行继续处理。
+
 例如，GitHub PR #15 的标题是 `[docs] Verify mapped and fallback commit attribution`，GitCode PR #17 使用相同标题。若源描述含以下两段，GitCode 保存的 Markdown 为
 
 ```markdown

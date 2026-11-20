@@ -1,6 +1,7 @@
 """Fixed-origin API requests for the inbound bridge."""
 
 import json
+from http.client import IncompleteRead
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -8,6 +9,10 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 class BridgeError(RuntimeError):
     pass
+
+
+class ApiTransportError(BridgeError):
+    """A connection failure leaves the outcome of a write unknown."""
 
 
 def same_account(obj, account):
@@ -54,7 +59,9 @@ class Api:
                 return json.loads(raw) if raw else None
         except HTTPError as error:
             raise ApiError(self.provider, error.code) from None
-        except (URLError, OSError, ValueError) as error:
+        except (URLError, OSError, IncompleteRead) as error:
+            raise ApiTransportError(f'Repository API request failed ({type(error).__name__})') from None
+        except ValueError as error:
             raise BridgeError(f'Repository API request failed ({type(error).__name__})') from None
 
     def call(self, method, path='', body=None, **params):

@@ -179,6 +179,9 @@ class FixtureApi:
         number = path.split('/')[2]
         pull = self.fixture.target_pulls[number]
         if method == 'PATCH':
+            if self.fixture.drop_first_publication_body:
+                self.fixture.drop_first_publication_body = False
+                body = {name: value for name, value in body.items() if name != 'body'}
             pull.update(body)
             if self.fixture.trim_published_body:
                 pull['body'] = pull['body'].rstrip()
@@ -221,6 +224,7 @@ class BridgeTests(unittest.TestCase):
         self.lose_response = None
         self.deny_once = {}
         self.trim_published_body = False
+        self.drop_first_publication_body = False
         self.change_branch_before_merge = False
         self.bot_email = BOT['email']
         self.bot_profile_email = None
@@ -594,7 +598,33 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual((pull['title'], pull['body']), (title, f'{source_link} <-> {target_link}\n\n{body}'))
         self.assertEqual(len(self.target_pulls), 1)
 
-    def test_changed_published_markdown_stops_before_merge_and_is_repaired_on_retry(self):
+    @patch('bridge.sleep')
+    def test_partial_publication_recovers_and_merges_in_the_same_push(self, sleep):
+        source = self.source_commit({'new.txt': b'new'}, b'change', [self.source_base])
+        markdown = 'Original **Markdown**.\r\n\r\n- Unchanged.  \r\n'
+        self.source_pull(source, 77, title='Publish once', body=markdown)
+        self.source_issue_comments['77'] = [{'id': 5, 'user': {'id': 10}, 'body': 'Review once.',
+                                             'created_at': '2026-11-01T12:00:00Z'}]
+        self.drop_first_publication_body = True
+        output = self.run_bridge()
+        self.assertIn('IMPORTED 1', output)
+        self.assertEqual(sleep.call_args_list, [call(2), call(5), call(10)])
+        self.assertEqual(self.target.tree(self.target_head()), self.source.tree(source))
+        self.assertIn('CURRENT', self.run_bridge())
+        self.assertEqual(list(self.target_pulls), ['1'])
+        self.assertEqual(self.pr_calls.count(('PATCH', 'bot-token')), 2)
+        self.assertEqual(self.pr_calls.count(('PUT', 'bot-token')), 1)
+        self.assertEqual(self.review_writes, [('alice-token', {'body': 'Review once.'})])
+        pull = self.target_pulls['1']
+        self.assertEqual((pull['title'], pull['state'], pull['draft']), ('Publish once', 'merged', False))
+        self.assertEqual(pull['body'], f'[GitHub PR #77](https://github.com/{GITHUB}/pull/77) <-> '
+                                      f'[GitCode PR #1](https://gitcode.com/{GITCODE}/pull/1)\n\n{markdown}')
+        with self.session() as (_, store):
+            self.assertEqual(store.progress['cursor'], source)
+            self.assertIsNone(store.progress['pending'])
+
+    @patch('bridge.sleep')
+    def test_changed_published_markdown_stops_before_merge_and_is_repaired_on_retry(self, sleep):
         source = self.source_commit({'new.txt': b'new'}, b'change', [self.source_base])
         self.source_pull(source, 15, body='Original Markdown.  \n')
         self.trim_published_body = True
@@ -602,6 +632,11 @@ class BridgeTests(unittest.TestCase):
             self.run_bridge()
         self.assertEqual(self.target_head(), self.master)
         self.assertEqual(self.target_pulls['1']['state'], 'open')
+        self.assertEqual(self.pr_calls.count(('PATCH', 'bot-token')), 2)
+        self.assertEqual(sleep.call_count, 6)
+        with self.session() as (_, store):
+            self.assertEqual(store.progress['cursor'], self.source_base)
+            self.assertEqual(store.progress['pending']['number'], '1')
         self.trim_published_body = False
         self.run_bridge()
         self.assertEqual(self.target_pulls['1']['state'], 'merged')
