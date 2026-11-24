@@ -5,11 +5,11 @@ from contextlib import redirect_stdout
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from api import ApiError, BridgeError
+from api import Api, ApiError, BridgeError
 from bridge import Bridge
 from review_comments import CommentDelivery, plan_comments, preview_comments, read_comments
 
@@ -42,8 +42,8 @@ class SourceTests(unittest.TestCase):
         self.rows = {'/issues/5/comments': [], '/pulls/5/reviews': [], '/pulls/5/comments': [],
                      '/pulls/5/files': [{'filename': 'file.py', 'sha': HEAD, 'patch': '@@ -8 +8 @@\n-old\n+new'}]}
         self.source.pages.side_effect = self.rows.__getitem__
-        self.target.pages.return_value = [{'filename': 'file.py', 'blob_id': HEAD,
-                                           'patch': {'new_path': 'file.py', 'diff': '@@ -8 +8 @@\n-old\n+new'}}]
+        self.target.call.return_value = [{'filename': 'file.py', 'blob_id': HEAD,
+                                          'patch': {'new_path': 'file.py', 'diff': '@@ -8 +8 @@\n-old\n+new'}}]
 
     def test_orders_all_sources_by_instant_and_keeps_distinct_receipt_keys_and_markdown(self):
         self.rows['/issues/5/comments'] = [comment(7, 4), comment(50, 1, body=' \t\n'),
@@ -88,6 +88,35 @@ class SourceTests(unittest.TestCase):
             '> `file.py` · 原第 8 行 · RIGHT · 已过时/无法挂行',
         ]])
 
+    def test_verifies_the_last_file_of_a_large_pr_with_one_gitcode_request(self):
+        self.rows['/pulls/5/comments'] = [root(7, 1)]
+        comments, _ = read_comments(self.source, 5)
+        for count in (100, 107):
+            with self.subTest(count=count):
+                other_files = [{'filename': f'other-{i}.py'} for i in range(count - 1)]
+                source_files = other_files + self.rows['/pulls/5/files']
+                github = Api('github', None, 'org/source')
+                github.call = Mock(side_effect=[source_files[:100], source_files[100:]])
+                gitcode = Api('gitcode', None, 'org/target')
+                gitcode.call = Mock(return_value=other_files + self.target.call.return_value)
+
+                bridge = SimpleNamespace(github_api=github, target_api=gitcode)
+                plan = [(kind, payload) for _, kind, payload in plan_comments(bridge, 5, comments, '/pulls/24')]
+                self.assertEqual(plan, [('diff', {'body': RAW, 'path': 'file.py',
+                                                 'position': 8, 'position_type': 'text'})])
+                self.assertEqual(github.call.call_args_list, [
+                    call('GET', '/pulls/5/files', page=1, per_page=100),
+                    call('GET', '/pulls/5/files', page=2, per_page=100),
+                ])
+                gitcode.call.assert_called_once_with('GET', '/pulls/24/files')
+
+    def test_unexpected_gitcode_file_response_stops_review_planning(self):
+        self.rows['/pulls/5/comments'] = [root(7, 1)]
+        comments, _ = read_comments(self.source, 5)
+        self.target.call.return_value = {'message': 'files unavailable'}
+        with self.assertRaisesRegex(BridgeError, r'/pulls/24/files'):
+            list(plan_comments(self.bridge, 5, comments, '/pulls/24'))
+
     def test_preserves_bot_conversation_and_submitted_review_text(self):
         self.rows['/issues/5/comments'] = [comment(1, 1, user={'id': 42, 'type': 'Bot'})]
         self.rows['/pulls/5/reviews'] = [review(1, 2, 'APPROVED', RAW), review(2, 3, 'CHANGES_REQUESTED', ' \t'),
@@ -104,7 +133,7 @@ class SourceTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as output:
             preview_comments(self.bridge, 5)
         self.assertIn('pr_comment=2, diff_comment=0, single-line candidates=1', output.getvalue())
-        self.target.pages.assert_not_called()
+        self.target.call.assert_not_called()
         with redirect_stdout(io.StringIO()) as output:
             preview_comments(self.bridge, 5, '/pulls/24', {'issue:7': {'kind': 'pr'}})
         self.assertIn('pr_comment=1, diff_comment=1, single-line candidates=0', output.getvalue())
@@ -113,7 +142,7 @@ class SourceTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as output:
             preview_comments(self.bridge, 5, records={'9': '120'})
         self.assertIn('thread replies=0', output.getvalue())
-        self.target.call.assert_not_called()
+        self.target.call.assert_called_once_with('GET', '/pulls/24/files')
 
     def test_orders_each_thread_after_its_root_even_on_ties_and_excludes_draft_replies(self):
         self.rows['/pulls/5/reviews'] = [{'id': 41, 'state': 'PENDING'}]

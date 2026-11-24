@@ -167,8 +167,16 @@ def order_comments(comments, records):
 
 
 def review_files(api, pr_path, wanted, *, destination=False):
+    endpoint = pr_path + '/files'
+    if destination:
+        # GitCode returns the whole PR file list in one response and ignores page parameters.
+        rows = api.call('GET', endpoint)
+        if not isinstance(rows, list):
+            raise BridgeError(f'GitCode returned an invalid file list for {endpoint}')
+    else:
+        rows = api.pages(endpoint)
     files = {}
-    for row in api.pages(pr_path + '/files'):
+    for row in rows:
         path = row.get('filename')
         if path not in wanted:
             continue

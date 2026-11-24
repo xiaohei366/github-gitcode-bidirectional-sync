@@ -81,14 +81,14 @@ class FixtureApi:
 
     def pages(self, path, **params):
         self.fixture.calls.append((self.provider, 'GET', path))
-        if path.startswith('/pulls/') and path.endswith('/files'):
-            return iter(deepcopy(self.fixture.review_files[self.provider]))
         if self.provider == 'gitcode' and path.endswith('/comments'):
             kind = params.get('comment_type')
             assert kind in (None, 'pr_comment', 'diff_comment')
             return iter(deepcopy([note for note in self.fixture.review_notes.get(path.split('/')[2], [])
                                   if kind is None or note['comment_type'] == kind]))
         if self.provider == 'github':
+            if path.startswith('/pulls/') and path.endswith('/files'):
+                return iter(deepcopy(self.fixture.review_files['github']))
             if path.startswith('/issues/') and path.endswith('/events'):
                 return iter(deepcopy(self.fixture.source_events.get(path.split('/')[2], [])))
             if path.startswith('/issues/') and path.endswith('/comments'):
@@ -117,6 +117,8 @@ class FixtureApi:
                 return deepcopy(self.fixture.pull_details[path.split('/')[-1]])
             assert path.startswith('/commits/')
             return {'author': self.fixture.authors.get(path.split('/')[-1])}
+        if method == 'GET' and path.startswith('/pulls/') and path.endswith('/files'):
+            return deepcopy(self.fixture.review_files['gitcode'])
         if method == 'GET' and path.startswith('/pulls/comments/'):
             return deepcopy(self.fixture.review_details[path.rsplit('/', 1)[1]])
         if method == 'POST' and path.endswith('/comments'):
@@ -1514,6 +1516,32 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(store.review_comments, {'1': {'11': '101', '12': '102', '13': '103', '14': '104'}})
         self.run_bridge()
         self.assertEqual(len(self.review_writes), 4)
+
+    def test_pending_pr_resumes_after_a_file_list_read_fails(self):
+        root = self.review_pr()
+        self.source_comments['5'] = [root, dict(root, id=12, in_reply_to_id=root['id'])]
+        other_files = [{'filename': f'other-{i}.txt'} for i in range(106)]
+        for files in self.review_files.values():
+            files[:0] = other_files
+        self.deny_once[('bot-token', 'GET', '/pulls/1/files')] = 503
+        with self.assertRaisesRegex(ApiError, '503'):
+            self.run_bridge()
+        with self.session() as (_, store):
+            self.assertEqual(store.progress['pending']['number'], '1')
+            self.assertEqual(store.progress['cursor'], self.source_base)
+        self.assertFalse(self.review_writes)
+
+        self.run_bridge()
+        self.run_bridge()
+        self.assertEqual(list(self.target_pulls), ['1'])
+        self.assertEqual(self.target_pulls['1']['state'], 'merged')
+        [note] = self.review_notes['1']
+        self.assertEqual((note['comment_type'], note['body']), ('diff_comment', root['body']))
+        self.assertEqual([child['body'] for child in note['reply']], [root['body']])
+        self.assertEqual(self.calls.count(('gitcode', 'POST', '/pulls')), 1)
+        with self.session() as (_, store):
+            self.assertIsNone(store.progress['pending'])
+            self.assertEqual(store.progress['cursor'], self.source.run('rev-parse', SOURCE).stdout.strip())
 
     def test_unanchorable_roots_become_located_pr_comments_before_merge(self):
         base = self.review_pr()
